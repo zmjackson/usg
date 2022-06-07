@@ -1,96 +1,143 @@
+use std::collections::HashSet;
 use std::env;
-use std::fs;
-use std::process::Command;
-use std::str;
+use std::sync::{mpsc, Arc, Mutex};
 use std::{thread, time::Duration};
 
-fn get_uptime() -> f64 {
-    fs::read_to_string("/proc/uptime")
-        .expect("Could not read /proc/uptime")
-        .split_whitespace()
-        .next()
-        .unwrap()
-        .parse()
-        .unwrap()
+use anyhow::{Context, Result};
+use pcap::Device;
+use procfs::net::TcpNetEntry;
+use procfs::process::FDInfo;
+use procfs::{page_size, process::FDTarget, process::Process, process::Stat, CpuInfo, KernelStats};
+
+// Logic stolen from htop's LinuxProcessList_scanCPUTime
+// Returns total ticks of CPU
+fn total_cpu_time() -> Result<u64> {
+    let cpu = KernelStats::new()?.total;
+    let user = cpu.user - cpu.guest.unwrap_or(0);
+    let nice = cpu.nice - cpu.guest_nice.unwrap_or(0);
+    let total_idle = cpu.idle + cpu.iowait.unwrap_or(0);
+    let total_system = cpu.system + cpu.irq.unwrap_or(0) + cpu.softirq.unwrap_or(0);
+    let total_virt = cpu.guest.unwrap_or(0) + cpu.guest_nice.unwrap_or(0);
+    Ok(user + nice + total_system + total_idle + total_virt + cpu.steal.unwrap_or(0))
 }
 
-struct ProcStat {
-    utime: i64,
-    stime: i64,
-    cutime: i64,
-    cstime: i64,
-    start_time: i64,
+fn period(ticks: u64, prev_ticks: u64, num_cores: usize) -> f64 {
+    ticks.saturating_sub(prev_ticks) as f64 / num_cores as f64
 }
 
-fn get_stat(pid: i32) -> ProcStat {
-    let mut stats = fs::read_to_string(format!("/proc/{}/stat", pid))
-        .expect("Stat file not found")
-        .split_whitespace()
-        .map(|s| s.parse::<i64>())
-        .collect::<Vec<_>>();
-
-    ProcStat {
-        utime: stats.swap_remove(14 - 1).unwrap(),
-        stime: stats.swap_remove(15 - 1).unwrap(),
-        cutime: stats.swap_remove(16 - 1).unwrap(),
-        cstime: stats.swap_remove(17 - 1).unwrap(),
-        start_time: stats.swap_remove(22 - 1).unwrap(),
-    }
+fn cpu_usage(stat: &Stat, prev_stat: &Stat, period: f64) -> f64 {
+    ((stat.utime + stat.stime) - (prev_stat.utime + prev_stat.stime)) as f64 / period * 100.0
 }
 
-fn get_clock_tick() -> i32 {
-    let output = Command::new("getconf")
-        .arg("CLK_TCK")
-        .output()
-        .expect("getconf failed")
-        .stdout;
-
-    str::from_utf8(&output).unwrap().trim().parse().unwrap()
+fn process(pid: i32) -> Result<Process> {
+    Process::new(pid).context(format!("Could not locate process with pid {}", pid))
 }
 
-fn total_ticks(stat: &ProcStat, include_children: bool) -> i64 {
-    let parent_time = stat.utime + stat.stime;
-    if include_children {
-        parent_time + stat.cutime + stat.cstime
-    } else {
-        parent_time
-    }
+// Create a Berkley Packet Filter to find packets belonging to one of the ports in use by the process
+// Packets are considered a match if they have the same protocol, host address, and destination address
+// Therefore, we create a filter like:
+// (host 127.0.0.1 and host 127.0.0.1 and port 33791 and port 60914) or (...)
+fn build_packet_filter<F, T>(fd: F, tcp: T) -> String
+where
+    F: IntoIterator<Item = FDInfo>,
+    T: IntoIterator<Item = TcpNetEntry>,
+{
+    // Given a list of file descriptors, find the inodes of those that are sockets
+    let inodes: HashSet<_> = fd
+        .into_iter()
+        .filter_map(|fd| match fd.target {
+            FDTarget::Socket(inode) => Some(inode),
+            _ => None,
+        })
+        .collect();
+
+    // Add to the filter each TCP entry that corresponds to a socket in the fd list
+    tcp.into_iter()
+        .filter(|entry| inodes.contains(&entry.inode))
+        .map(|entry| {
+            format!(
+                "(host {} and host {} and port {} and port {})",
+                entry.local_address.ip(),
+                entry.remote_address.ip(),
+                entry.local_address.port(),
+                entry.remote_address.port()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" or ")
 }
 
-fn total_seconds(uptime: f64, starttime: i64, tick: i32) -> f64 {
-    uptime - ((starttime / tick as i64) as f64)
-}
-
-fn cpu_usage(tick_diff: i64, time_diff: f64, tick: i32) -> f64 {
-    100.0_f64 * ((tick_diff / tick as i64) as f64 / time_diff)
-}
-
-fn main() {
+fn main() -> Result<()> {
     let pid: i32 = env::args().collect::<Vec<String>>()[1].parse().unwrap();
-    let tick = get_clock_tick();
 
-    let initial_uptime = get_uptime();
-    let initial_stat = get_stat(pid);
-    let mut prev_total_ticks = total_ticks(&initial_stat, true);
-    let mut prev_total_seconds = total_seconds(initial_uptime, initial_stat.start_time, tick);
+    let page_size = page_size()?;
+    let cores = CpuInfo::new()?.num_cores();
+
+    let process = process(pid)?;
+    let mut prev_stat = process.stat.clone();
+    let mut prev_total_ticks = total_cpu_time()?;
+
+    let io = process.io()?;
+    let (mut prev_bytes_read, mut prev_bytes_written) = (io.read_bytes, io.write_bytes);
+
+    let bpf = build_packet_filter(process.fd()?, procfs::net::tcp()?);
+    println!("{bpf}");
+
+    let mut capture = Device::lookup()?.open()?;
+    capture.filter(&bpf, true)?;
+
+    let counter = Arc::new(Mutex::new(0_u64));
+    let thread_counter = Arc::clone(&counter);
+
+    let (sender, receiver) = mpsc::channel::<String>();
+
+    thread::spawn(move || {
+        while let Ok(packet) = capture.next() {
+            let mut bytes = thread_counter.lock().unwrap();
+            *bytes += packet.header.len as u64;
+            drop(bytes);
+
+            if let Ok(filter) = receiver.try_recv() {
+                println!("Received new filter");
+                capture.filter(&filter, true).unwrap();
+            }
+        }
+    });
+
+    let mut prev_net_bytes = 0;
 
     loop {
-        let uptime = get_uptime();
-        let stat = get_stat(pid);
-        let total_ticks = total_ticks(&stat, true);
-        let total_seconds = total_seconds(uptime, stat.start_time, tick);
+        let delay_ms = 1000;
+        let delay_s = delay_ms / 1000;
+        thread::sleep(Duration::from_millis(delay_ms));
+
+        let stat = process.stat()?; // stat() re-fetches the data
+        let total_ticks = total_cpu_time()?;
+        let period = period(total_ticks, prev_total_ticks, cores);
+        let cpu = cpu_usage(&stat, &prev_stat, period);
+
+        prev_stat = stat;
+        prev_total_ticks = total_ticks;
+
+        let mem = process.statm()?.resident * page_size as u64;
+
+        let io = process.io()?;
+        let read_bps = (io.read_bytes - prev_bytes_read) / delay_s;
+        let write_bps = (io.write_bytes - prev_bytes_written) / delay_s;
+        let io_rate = read_bps + write_bps;
+
+        prev_bytes_read = io.read_bytes;
+        prev_bytes_written = io.write_bytes;
+
+        let net_bytes = *counter.lock().unwrap();
+        let byte_diff = (net_bytes - prev_net_bytes) / delay_s;
+        prev_net_bytes = net_bytes;
+
         println!(
-            "CPU: {}%",
-            cpu_usage(
-                total_ticks - prev_total_ticks,
-                total_seconds - prev_total_seconds,
-                tick
-            )
+            "CPU: {:.1}% Mem: {}B I/O: {}B Net: {}B",
+            cpu, mem, io_rate, byte_diff
         );
 
-        prev_total_ticks = total_ticks;
-        prev_total_seconds = total_seconds;
-
-        thread::sleep(Duration::from_millis(1000));
+        sender.send(build_packet_filter(process.fd()?, procfs::net::tcp()?))?;
     }
 }
